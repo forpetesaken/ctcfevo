@@ -77,10 +77,11 @@ def fimo_to_bed(fimo_tsv, output_bed="ctcf_motifs.bed"):
 # Step 3: Analyze CTCF directionality at TAD boundaries
 # ============================================
 
-def analyze_ctcf_directionality(tads_file, ctcf_bed_file, window=5000):
+def analyze_ctcf_directionality(tads_file, ctcf_bed_file, window=7500):
     """
     Analyze CTCF orientation at TAD boundaries
     Should get ~90% convergent in human
+    Window size is 7.5kb on each side (total 15kb window, matching paper's 5kb boundary ±5kb)
     """
     print(f"\n{'='*50}")
     print("CTCF Directionality Analysis")
@@ -113,32 +114,61 @@ def analyze_ctcf_directionality(tads_file, ctcf_bed_file, window=5000):
     for idx, tad in tads.iterrows():
         if idx % 500 == 0:
             print(f"  Processing TAD {idx}/{len(tads)}...", end='\r')
-        
-        # Get CTCF at left boundary
+          # Define boundary windows (overlap semantics: motif overlaps window)
+        left_start = tad['start'] - window
+        left_end   = tad['start'] + window
+
+        right_start = tad['end'] - window
+        right_end   = tad['end'] + window
+
+        # Overlap test (motif overlaps the window)
         left_ctcf = ctcf[
-            (ctcf['chr'] == tad['chr']) & 
-            (ctcf['start'] >= tad['start'] - window) &
-            (ctcf['end'] <= tad['start'] + window)
-        ].sort_values('score', ascending=False)
-        
-        # Get CTCF at right boundary
+            (ctcf['chr'] == tad['chr']) &
+            (ctcf['end'] > left_start) &
+            (ctcf['start'] < left_end)
+        ].copy()
+
         right_ctcf = ctcf[
-            (ctcf['chr'] == tad['chr']) & 
-            (ctcf['start'] >= tad['end'] - window) &
-            (ctcf['end'] <= tad['end'] + window)
-        ].sort_values('score', ascending=False)
-        
-        # Check if both boundaries have CTCF
-        if len(left_ctcf) == 0 or len(right_ctcf) == 0:
-            if len(left_ctcf) == 0 and len(right_ctcf) == 0:
+            (ctcf['chr'] == tad['chr']) &
+            (ctcf['end'] > right_start) &
+            (ctcf['start'] < right_end)
+        ].copy()
+
+        # If no motif or only one side has motifs, count and continue
+        if left_ctcf.shape[0] == 0 or right_ctcf.shape[0] == 0:
+            if left_ctcf.shape[0] == 0 and right_ctcf.shape[0] == 0:
                 results['no_ctcf'] += 1
             else:
                 results['single_side'] += 1
             continue
-        
-        # Get strongest motif at each side
-        left_strand = left_ctcf.iloc[0]['strand']
-        right_strand = right_ctcf.iloc[0]['strand']
+
+        # Choose the motif nearest to the boundary coordinate (prefer closer, then higher score)
+        def pick_nearest(df, boundary_coord):
+            if df.shape[0] == 0:
+                return None
+            df = df.copy()
+            # ensure numeric
+            df['start'] = df['start'].astype(int)
+            df['end']   = df['end'].astype(int)
+            df['score'] = pd.to_numeric(df['score'], errors='coerce').fillna(0)
+            df['center'] = ((df['start'] + df['end']) // 2).astype(int)
+            df['dist'] = (df['center'] - int(boundary_coord)).abs()
+            df = df.sort_values(['dist', 'score'], ascending=[True, False])
+            return df.iloc[0]
+
+        left_best = pick_nearest(left_ctcf, tad['start'])
+        right_best = pick_nearest(right_ctcf, tad['end'])
+
+        # Safety: if any side fails after pick_nearest
+        if left_best is None or right_best is None:
+            if left_best is None and right_best is None:
+                results['no_ctcf'] += 1
+            else:
+                results['single_side'] += 1
+            continue
+
+        left_strand = left_best['strand']
+        right_strand = right_best['strand']
         
         # Classify orientation
         if left_strand == '+' and right_strand == '-':
@@ -191,7 +221,7 @@ def analyze_ctcf_directionality(tads_file, ctcf_bed_file, window=5000):
 
 def plot_ctcf_orientations(results, output_file="ctcf_orientations.pdf"):
     """
-    Create a bar plot of CTCF orientations
+    Create a pie chart of CTCF orientations
     """
     total_with_both = (results['convergent'] + results['divergent'] + 
                        results['tandem_forward'] + results['tandem_reverse'])
@@ -201,8 +231,8 @@ def plot_ctcf_orientations(results, output_file="ctcf_orientations.pdf"):
         return
     
     # Prepare data
-    categories = ['Convergent\n(→ ←)', 'Divergent\n(← →)', 
-                  'Tandem\n(→ →)', 'Tandem\n(← ←)']
+    categories = ['Convergent (→ ←)', 'Divergent (← →)', 
+                  'Tandem (→ →)', 'Tandem (← ←)']
     counts = [
         results['convergent'],
         results['divergent'],
@@ -212,29 +242,31 @@ def plot_ctcf_orientations(results, output_file="ctcf_orientations.pdf"):
     percentages = [c / total_with_both * 100 for c in counts]
     
     # Create plot
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=(10, 8))
     
     colors = ['#2ecc71', '#e74c3c', '#3498db', '#9b59b6']
-    bars = ax.bar(categories, percentages, color=colors, alpha=0.8, edgecolor='black')
+    wedges, texts, autotexts = ax.pie(counts, labels=categories, colors=colors, 
+                                     autopct='%1.1f%%', pctdistance=0.85,
+                                     wedgeprops=dict(width=0.5))
     
-    # Add value labels on bars
-    for bar, pct, count in zip(bars, percentages, counts):
-        height = bar.get_height()
-        ax.text(bar.get_x() + bar.get_width()/2., height,
-                f'{pct:.1f}%\n(n={count})',
-                ha='center', va='bottom', fontsize=10, fontweight='bold')
+    # Add a circle at the center to create a donut chart effect
+    centre_circle = plt.Circle((0,0), 0.70, fc='white')
+    fig.gca().add_artist(centre_circle)
     
-    # Add horizontal line at 90%
-    ax.axhline(y=90, color='red', linestyle='--', linewidth=2, 
-               label='Expected for mammals (~90%)')
+    # Add count labels in the center portion
+    for i, (pct, count) in enumerate(zip(percentages, counts)):
+        y = 0.3 - i*0.15  # Stagger the count labels vertically
+        plt.text(0, y, f'n = {count}', 
+                ha='center', va='center',
+                fontsize=10, color=colors[i])
     
-    ax.set_ylabel('Percentage of TAD Pairs (%)', fontsize=12, fontweight='bold')
-    ax.set_xlabel('CTCF Orientation', fontsize=12, fontweight='bold')
     ax.set_title('CTCF Motif Orientation at TAD Boundaries', 
-                 fontsize=14, fontweight='bold')
-    ax.set_ylim(0, 100)
-    ax.legend(fontsize=10)
-    ax.grid(axis='y', alpha=0.3)
+                 fontsize=14, fontweight='bold', pad=20)
+                 
+    # Style the percentage labels
+    plt.setp(autotexts, size=10, weight="bold")
+    # Style the category labels
+    plt.setp(texts, size=10)
     
     plt.tight_layout()
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
@@ -248,7 +280,7 @@ def plot_ctcf_orientations(results, output_file="ctcf_orientations.pdf"):
 def main():
     # File paths - MODIFY THESE FOR YOUR DATA
     motif_file = "MA0139.1.meme"  # Your CTCF motif file
-    genome_fasta = "hg38.fa"      # Your genome FASTA
+    genome_fasta = "/gpfs0/juicer/references/hg38/hg38.fa"      # Your genome FASTA
     tads_file = "TADs.bed"        # Your TAD boundaries (chr, start, end)
     
     # Step 1: Run FIMO
@@ -269,7 +301,7 @@ def main():
     results = analyze_ctcf_directionality(
         tads_file=tads_file,
         ctcf_bed_file="ctcf_motifs.bed",
-        window=5000
+        window=7500  # 7.5kb on each side = 15kb total window
     )
     
     # Step 4: Visualize
@@ -277,6 +309,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    motif_file = "MA0139.1.meme"  # Your CTCF motif file
-    genome_fasta = "hg38.fa"      # Your genome FASTA
-    tads_file = "TADs.bed"        # Your TAD boundaries (chr, start, end)
